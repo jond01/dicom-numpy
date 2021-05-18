@@ -64,13 +64,16 @@ def combine_slices(datasets, rescale=None):
 
     If any of these conditions are not met, a `dicom_numpy.DicomImportException` is raised.
     """
-    slice_datasets = [ds for ds in datasets if not _is_dicomdir(ds)]
+    # slice_datasets = [ds for ds in datasets if not _is_dicomdir(ds)]
+    slice_datasets = datasets
 
     if len(slice_datasets) == 0:
         raise DicomImportException("Must provide at least one image DICOM dataset")
 
-    _validate_slices_form_uniform_grid(slice_datasets)
-
+    # slice_datasets, cosines, slice_spacing = _validate_slices_form_uniform_grid(slice_datasets)
+    # voxels = _merge_slice_pixel_arrays(slice_datasets, rescale, is_sorted=True)
+    # transform = _ijk_to_patient_xyz_transform_matrix(slice_datasets, is_sorted=True, cosines=cosines,
+    #                                                  slice_spacing=slice_spacing)
     voxels = _merge_slice_pixel_arrays(slice_datasets, rescale)
     transform = _ijk_to_patient_xyz_transform_matrix(slice_datasets)
 
@@ -93,22 +96,23 @@ def _is_dicomdir(dataset):
     return media_sop_class == '1.2.840.10008.1.3.10'
 
 
-def _merge_slice_pixel_arrays(slice_datasets, rescale=None):
-    sorted_slice_datasets = sort_by_slice_position(slice_datasets)
+def _merge_slice_pixel_arrays(slice_datasets, rescale=None, is_sorted=False):
+    if not is_sorted:
+        slice_datasets = sort_by_slice_position(slice_datasets)
 
     if rescale is None:
-        rescale = any(_requires_rescaling(d) for d in sorted_slice_datasets)
+        rescale = any(_requires_rescaling(d) for d in slice_datasets)
 
-    first_dataset = sorted_slice_datasets[0]
+    first_dataset = slice_datasets[0]
     slice_dtype = first_dataset.pixel_array.dtype
     slice_shape = first_dataset.pixel_array.T.shape
-    num_slices = len(sorted_slice_datasets)
+    num_slices = len(slice_datasets)
 
     voxels_shape = slice_shape + (num_slices,)
     voxels_dtype = np.float32 if rescale else slice_dtype
     voxels = np.empty(voxels_shape, dtype=voxels_dtype, order='F')
 
-    for k, dataset in enumerate(sorted_slice_datasets):
+    for k, dataset in enumerate(slice_datasets):
         pixel_array = dataset.pixel_array.T
         if rescale:
             slope = float(getattr(dataset, 'RescaleSlope', 1))
@@ -123,13 +127,19 @@ def _requires_rescaling(dataset):
     return hasattr(dataset, 'RescaleSlope') or hasattr(dataset, 'RescaleIntercept')
 
 
-def _ijk_to_patient_xyz_transform_matrix(slice_datasets):
-    first_dataset = sort_by_slice_position(slice_datasets)[0]
-    image_orientation = first_dataset.ImageOrientationPatient
-    row_cosine, column_cosine, slice_cosine = _extract_cosines(image_orientation)
+def _ijk_to_patient_xyz_transform_matrix(slice_datasets, is_sorted=False, cosines=None, slice_spacing=None):
+    if not is_sorted:
+        slice_datasets = sort_by_slice_position(slice_datasets)
+
+    first_dataset = slice_datasets[0]
+    if cosines is None:
+        image_orientation = first_dataset.ImageOrientationPatient
+        cosines = _extract_cosines(image_orientation)
+    row_cosine, column_cosine, slice_cosine = cosines
 
     row_spacing, column_spacing = first_dataset.PixelSpacing
-    slice_spacing = _slice_spacing(slice_datasets)
+    if slice_spacing is None:
+        slice_spacing = _slice_spacing(slice_datasets)
 
     transform = np.identity(4, dtype=np.float32)
 
@@ -148,6 +158,7 @@ def _validate_slices_form_uniform_grid(slice_datasets):
     evenly-spaced grid of data.
     Some of these checks are probably not required if the data follows the
     DICOM specification, however it seems pertinent to check anyway.
+    Return the datasets ordered by their position and the grid properties: cosines and slice spacing
     """
     invariant_properties = [
         'Modality',
@@ -161,23 +172,37 @@ def _validate_slices_form_uniform_grid(slice_datasets):
         'BitsAllocated',
     ]
 
-    for property_name in invariant_properties:
-        _slice_attribute_equal(slice_datasets, property_name)
+    # for property_name in invariant_properties:
+    #     _slice_attribute_equal(slice_datasets, property_name)
+    # _slice_attributes_equal(slice_datasets, invariant_properties)
 
-    _validate_image_orientation(slice_datasets[0].ImageOrientationPatient)
+    cosines = _extract_cosines(slice_datasets[0].ImageOrientationPatient)
+    _validate_image_orientation(None, cosines)
     _slice_ndarray_attribute_almost_equal(slice_datasets, 'ImageOrientationPatient', 1e-5)
 
     slice_positions = _slice_positions(slice_datasets)
-    _check_for_missing_slices(slice_positions)
+    # sort both positions and datasets
+    slice_positions, slice_datasets = zip(*[(s, d) for (s, d) in sorted(zip(slice_positions, slice_datasets))])
+    # but first check for missing slices
+    _check_for_missing_slices(slice_positions, is_sorted=True)
+    slice_spacing = _slice_spacing(slice_datasets, slice_positions, is_sorted=True)
+
+    return slice_datasets, cosines, slice_spacing
 
 
-def _validate_image_orientation(image_orientation):
+def _validate_image_orientation(image_orientation, cosines=None):
     """
     Ensure that the image orientation is supported
     - The direction cosines have magnitudes of 1 (just in case)
     - The direction cosines are perpendicular
     """
-    row_cosine, column_cosine, slice_cosine = _extract_cosines(image_orientation)
+
+    if image_orientation is not None:
+        cosines = _extract_cosines(image_orientation)
+    elif cosines is None:
+        raise ValueError('Missing argument (at least one should be not None)')
+
+    row_cosine, column_cosine, slice_cosine = cosines
 
     if not _almost_zero(np.dot(row_cosine, column_cosine), 1e-4):
         raise DicomImportException(f"Non-orthogonal direction cosines: {row_cosine}, {column_cosine}")
@@ -219,6 +244,17 @@ def _slice_attribute_equal(slice_datasets, property_name):
             raise DicomImportException(msg)
 
 
+def _slice_attributes_equal(slice_datasets, invariant_properties):
+    initial_values = {prop: slice_datasets[0][prop] for prop in invariant_properties}
+    for dataset in slice_datasets[1:]:
+        values = {prop: dataset[prop] for prop in invariant_properties}
+        if values != initial_values:
+            for prop in invariant_properties:
+                if values[prop] != initial_values[prop]:
+                    msg = f'All slices must have the same value for "{prop}": {values[prop]} != {initial_values[prop]}'
+                    raise DicomImportException(msg)
+
+
 def _slice_ndarray_attribute_almost_equal(slice_datasets, property_name, abs_tol):
     initial_value = getattr(slice_datasets[0], property_name, None)
     for dataset in slice_datasets[1:]:
@@ -235,9 +271,11 @@ def _slice_positions(slice_datasets):
     return [np.dot(slice_cosine, d.ImagePositionPatient) for d in slice_datasets]
 
 
-def _check_for_missing_slices(slice_positions):
+def _check_for_missing_slices(slice_positions, is_sorted=False):
     if len(slice_positions) > 1:
-        slice_positions_diffs = np.diff(sorted(slice_positions))
+        if not is_sorted:
+            slice_positions = sorted(slice_positions)
+        slice_positions_diffs = np.diff(slice_positions)
         if not np.allclose(slice_positions_diffs, slice_positions_diffs[0], atol=0, rtol=1e-5):
             # TODO: figure out how we should handle non-even slice spacing
             msg = f"The slice spacing is non-uniform. Slice spacings:\n{slice_positions_diffs}"
@@ -247,10 +285,15 @@ def _check_for_missing_slices(slice_positions):
             raise DicomImportException('It appears there are missing slices')
 
 
-def _slice_spacing(slice_datasets):
+def _slice_spacing(slice_datasets, slice_positions=None, is_sorted=False):
     if len(slice_datasets) > 1:
-        slice_positions = _slice_positions(slice_datasets)
-        slice_positions_diffs = np.diff(sorted(slice_positions))
+        if slice_positions is None:
+            slice_positions = _slice_positions(slice_datasets)
+            is_sorted = False
+        if not is_sorted:
+            # no need to sort the datasets
+            slice_positions = sorted(slice_positions)
+        slice_positions_diffs = np.diff(slice_positions)  # TODO: this diff comes after _check_for_missing_slices' diff
         return np.mean(slice_positions_diffs)
 
     return getattr(slice_datasets[0], 'SpacingBetweenSlices', 0)
