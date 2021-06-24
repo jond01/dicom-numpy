@@ -3,18 +3,24 @@ A setuptools based setup module.
 """
 
 from setuptools import setup, find_packages
-from os import path
 
-from dicom_numpy import __version__
 
-here = path.abspath(path.dirname(__file__))
+def get_version(path):
+    with open(path, 'r') as fp:
+        for line in fp:
+            if line.startswith('__version__'):
+                delim = '"' if '"' in line else "'"
+                return line.split(delim)[1]
+        else:
+            raise RuntimeError("Unable to find version string.")
 
-with open(path.join(here, 'README.rst'), encoding='utf-8') as f:
+
+with open('README.rst', encoding='utf-8') as f:
     long_description = f.read()
 
 setup(
     name='dicom_numpy',
-    version=__version__,
+    version=get_version("dicom_numpy/__init__.py"),
     description='Extract image data into a 3D numpy array from a set of DICOM files.',
     long_description=long_description,
     url='https://github.com/innolitics/dicom-numpy',
